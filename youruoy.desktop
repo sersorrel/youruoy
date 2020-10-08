@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=YourUoY (MIME handler)
+Exec=x-terminal-emulator -e youruoy auth --url %u
+MimeType=x-scheme-handler/uk.ac.york.student-app;
+NoDisplay=true

@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import pathlib
+import secrets
+import textwrap
+import traceback
+import urllib.parse
+import urllib.request
+from typing import Optional, Union
+
+
+REDIRECT_URL = "uk.ac.york.student-app://auth"
+XDG_CACHE_HOME: Optional[Union[str, bytes]] = os.environb.get(b"XDG_CACHE_HOME")
+if XDG_CACHE_HOME is None or not os.path.isabs(XDG_CACHE_HOME):
+    XDG_CACHE_HOME = os.path.expanduser("~/.cache/")
+CACHE_DIR = pathlib.Path(os.fsdecode(XDG_CACHE_HOME))
+AUTH_FILE = CACHE_DIR / "youruoy-auth"
+
+
+def auth(args):
+    if args.client_id is None and not args.url:
+        print("A client ID is required (supply with --client-id)")
+        return
+    if args.url:  # NB: this branch runs in an ephemeral terminal window
+        try:
+            assert args.url.startswith(REDIRECT_URL)
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(args.url).query)
+            with open(AUTH_FILE, "r") as f:
+                passed_state, passed_code_verifier, client_id = f.read().split(" ")
+            AUTH_FILE.unlink()
+            if params["state"][0] != passed_state:
+                print(
+                    f"State mismatch ({params['state'][0]!r} vs {passed_state!r}), not continuing. "
+                    "Maybe multiple instances are running, or you used an old URL."
+                )
+                return
+            with urllib.request.urlopen(
+                urllib.request.Request(
+                    "https://auth.aws.york.ac.uk/oauth2/token",
+                    urllib.parse.urlencode(
+                        {
+                            "code": params["code"][0],
+                            "grant_type": "authorization_code",
+                            "redirect_uri": REDIRECT_URL,
+                            "code_verifier": passed_code_verifier,
+                            "client_id": client_id,
+                        }
+                    ).encode("ascii"),
+                )
+            ) as r:
+                response = r.read()
+                data = json.loads(response)
+                if data["token_type"] != "Bearer":
+                    print(f"Warning, unexpected token_type {data['token_type']!r}")
+                expires_in_minutes, expires_in_seconds = divmod(data["expires_in"], 60)
+                expires_in_hours, expires_in_minutes = divmod(expires_in_minutes, 60)
+                print(
+                    textwrap.dedent(
+                        f"""\
+                            id_token: {data['id_token']}
+
+                            access_token: {data['access_token']}
+
+                            refresh_token: {data['refresh_token']}
+
+                            Your tokens will expire in {data['expires_in']} seconds ({expires_in_hours} hours and {expires_in_minutes} minutes).
+                        """
+                    )
+                )
+                print("All done!")
+        except Exception:
+            traceback.print_exc()
+        finally:
+            input("\n(press enter to quit)")
+    elif args.refresh:
+        with urllib.request.urlopen(
+            urllib.request.Request(
+                "https://auth.aws.york.ac.uk/oauth2/token",
+                urllib.parse.urlencode(
+                    {
+                        "grant_type": "refresh_token",
+                        "refresh_token": args.refresh,
+                        "client_id": args.client_id,
+                    }
+                ).encode("ascii"),
+            )
+        ) as r:
+            response = r.read()
+            data = json.loads(response)
+            if data["token_type"] != "Bearer":
+                print(f"Warning, unexpected token_type {data['token_type']!r}")
+            expires_in_minutes, expires_in_seconds = divmod(data["expires_in"], 60)
+            expires_in_hours, expires_in_minutes = divmod(expires_in_minutes, 60)
+            print(
+                textwrap.dedent(
+                    f"""\
+                        id_token: {data['id_token']}
+
+                        access_token: {data['access_token']}
+                    """
+                    + (
+                        f"""
+                        refresh_token: {data['refresh_token']}
+                    """
+                        if "refresh_token" in data
+                        else ""
+                    )
+                    + f"""
+                        Your tokens will expire in {data['expires_in']} seconds ({expires_in_hours} hours and {expires_in_minutes} minutes).
+                    """
+                )
+            )
+            print("All done!")
+    else:
+        state = secrets.token_bytes(8)
+        state_str = state.hex()
+        code_verifier = secrets.token_urlsafe(48)
+        code_challenge = (
+            base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode()).digest())
+            .decode()
+            .rstrip("=")
+        )
+        with open(AUTH_FILE, "w") as f:
+            f.write(state_str + " " + code_verifier + " " + args.client_id)
+        print(
+            textwrap.dedent(
+                f"Visit this URL in your web browser: https://auth.aws.york.ac.uk/oauth2/authorize?redirect_uri={REDIRECT_URL}&client_id={args.client_id}&response_type=code&state={state_str}&code_challenge={code_challenge}&code_challenge_method=S256"
+            )
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    subparsers = parser.add_subparsers()
+
+    auth_parser = subparsers.add_parser("auth", help="obtain an authentication token")
+    auth_parser.add_argument("--url", help=argparse.SUPPRESS)
+    auth_parser.add_argument(
+        "--client-id", help="the OAuth client ID to use", metavar="ID"
+    )
+    # TODO: putting secrets in command-line arguments is quite bad
+    auth_parser.add_argument(
+        "--refresh",
+        help="supply an existing refresh token (dangerous)",
+        metavar="TOKEN",
+    )
+    auth_parser.set_defaults(_fn=auth)
+
+    help_parser = subparsers.add_parser("help")
+
+    args = parser.parse_args()
+    if not hasattr(args, "_fn"):
+        parser.print_usage()
+        return
+    args._fn(args)
+
+
+if __name__ == "__main__":
+    main()
